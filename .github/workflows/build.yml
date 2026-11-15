@@ -1,0 +1,108 @@
+name: Linphone Custom Build (10-Call & Bubble Overlay)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      linphone_branch:
+        description: 'Linphone Android Branch/Tag (e.g. release/5.2, release/5.1, master)'
+        required: false
+        default: 'release/5.2'
+      build_type:
+        description: 'Build Type (debug or release)'
+        required: false
+        default: 'debug'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Custom Linphone APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: 11076708
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Clone Linphone Android Source
+        run: |
+          TARGET_BRANCH="${{ github.event.inputs.linphone_branch || 'release/5.2' }}"
+          echo "Attempting to clone branch: $TARGET_BRANCH"
+          
+          # Clone with fallback strategy (release branch -> master branch -> Belledonne mirror)
+          if git clone --depth 1 --branch "$TARGET_BRANCH" https://github.com/BelledonneCommunications/linphone-android.git linphone-android; then
+            echo "Successfully cloned branch $TARGET_BRANCH from GitHub mirror."
+          elif git clone --depth 1 --branch "$TARGET_BRANCH" https://gitlab.linphone.org/BC/public/linphone-android.git linphone-android; then
+            echo "Successfully cloned branch $TARGET_BRANCH from Linphone GitLab."
+          else
+            echo "Branch $TARGET_BRANCH failed. Falling back to default branch..."
+            git clone --depth 1 https://github.com/BelledonneCommunications/linphone-android.git linphone-android
+          fi
+
+      - name: Run Linphone Patcher (10 Calls + Messenger Bubble)
+        run: |
+          python3 patch_linphone.py --target linphone-android
+
+      - name: Configure Gradle Environment
+        run: |
+          cd linphone-android
+          mkdir -p ~/.gradle
+          echo "org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m -XX:+HeapDumpOnOutOfMemoryError" >> ~/.gradle/gradle.properties
+          echo "org.gradle.parallel=true" >> ~/.gradle/gradle.properties
+          echo "android.useAndroidX=true" >> gradle.properties
+          echo "android.enableJetifier=true" >> gradle.properties
+
+      - name: Build APK with Gradle
+        run: |
+          cd linphone-android
+          chmod +x ./gradlew
+          BUILD_TYPE="${{ github.event.inputs.build_type || 'debug' }}"
+          if [ "$BUILD_TYPE" = "release" ]; then
+            ./gradlew assembleRelease --stacktrace --no-daemon || ./gradlew assembleDebug --stacktrace --no-daemon
+          else
+            ./gradlew assembleDebug --stacktrace --no-daemon
+          fi
+
+      - name: Prepare APK Artifacts
+        run: |
+          mkdir -p artifacts
+          FOUND_APK=$(find linphone-android/app/build/outputs/apk/ -type f -name "*.apk" | head -n 1)
+          if [ -n "$FOUND_APK" ]; then
+            echo "Found generated APK: $FOUND_APK"
+            cp "$FOUND_APK" artifacts/Linphone-Custom-10Call-MessengerBubble-Debug.apk
+            ls -lh artifacts/
+          else
+            echo "Error: No APK file was generated!"
+            exit 1
+          fi
+
+      - name: Upload Linphone Custom APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Linphone-Custom-10Call-MessengerBubble-APK
+          path: artifacts/Linphone-Custom-10Call-MessengerBubble-Debug.apk
+          if-no-files-found: error
+          retention-days: 30
