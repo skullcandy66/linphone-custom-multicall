@@ -429,7 +429,8 @@ class CallBubbleOverlayService : Service() {
 
         val statusText = if (currentCall != null) {
             val stateText = MultiCallHelper.getCallStateText(currentCall)
-            if (core.callsNb > 1) "$stateText • ${core.callsNb} Calls" else stateText
+            val callsCount = core?.callsNb ?: 0
+            if (callsCount > 1) "$stateText • $callsCount Calls" else stateText
         } else {
             "Calling..."
         }
@@ -947,7 +948,7 @@ class CallBubbleOverlayService : Service() {
                         call.terminate()
                         container.postDelayed({
                             refreshFloatingWindowContent()
-                            if (core.callsNb == 0) dismissBubble(this@CallBubbleOverlayService)
+                            if ((core?.callsNb ?: 0) == 0) dismissBubble(this@CallBubbleOverlayService)
                         }, 250)
                     } catch (e: Exception) {
                         e.printStackTrace()
