@@ -57,11 +57,9 @@ object MultiCallHelper {
             }
 
             val address = core.interpretUrl(destination, true) ?: core.createAddress(destination)
-            val params = core.createCallParams(null)
-            params?.enableAudio(true)
-
             val call = if (address != null) {
-                core.inviteAddressWithParams(address, params)
+                val params = core.createCallParams(null)
+                if (params != null) core.inviteAddressWithParams(address, params) else core.inviteAddress(address)
             } else {
                 core.invite(destination)
             }
@@ -726,8 +724,9 @@ class CallBubbleOverlayService : Service() {
                 setPadding(dpToPx(6), dpToPx(4), dpToPx(6), dpToPx(4))
                 setOnClickListener {
                     try {
-                        core.micEnabled = !core.micEnabled
-                        text = if (!core.micEnabled) "Muted" else "Mute"
+                        val newMic = !core.isMicEnabled
+                        core.enableMic(newMic)
+                        text = if (!newMic) "Muted" else "Mute"
                     } catch (e: Exception) {
                         e.printStackTrace()
                     }
