@@ -774,12 +774,12 @@ class LinphonePatcher:
                 content = gf.read_text(encoding="utf-8")
                 modified = False
 
-                # Disable lint abort on error
-                if "lintOptions {" in content and "abortOnError false" not in content:
-                    content = content.replace("lintOptions {", "lintOptions {\n        abortOnError false\n        checkReleaseBuilds false")
+                # Disable Android lint abort on error (using regex word boundary to avoid matching ktlint)
+                if re.search(r'\blintOptions\s*\{', content) and "abortOnError false" not in content:
+                    content = re.sub(r'(\blintOptions\s*\{)', r'\1\n        abortOnError false\n        checkReleaseBuilds false', content, count=1)
                     modified = True
-                elif "lint {" in content and "abortOnError = false" not in content:
-                    content = content.replace("lint {", "lint {\n        abortOnError = false\n        checkReleaseBuilds = false")
+                elif re.search(r'(?<!kt)\blint\s*\{', content) and "abortOnError = false" not in content:
+                    content = re.sub(r'((?<!kt)\blint\s*\{)', r'\1\n        abortOnError = false\n        checkReleaseBuilds = false', content, count=1)
                     modified = True
 
                 if modified:
