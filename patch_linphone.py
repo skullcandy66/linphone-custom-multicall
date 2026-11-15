@@ -609,7 +609,7 @@ class LinphonePatcher:
                 content = manifest_path.read_text(encoding="utf-8")
                 modified = False
 
-                # Permissions to inject
+                # Permissions to inject safely right before <application
                 permissions = [
                     '<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />',
                     '<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />',
@@ -617,11 +617,8 @@ class LinphonePatcher:
                 ]
 
                 for perm in permissions:
-                    if perm not in content:
-                        content = content.replace("<manifest", f"<manifest\n    {perm}\n", 1)
-                        if perm not in content:
-                            # Fallback: insert before <application
-                            content = content.replace("<application", f"    {perm}\n<application", 1)
+                    if perm not in content and "<application" in content:
+                        content = content.replace("<application", f"{perm}\n    <application", 1)
                         modified = True
 
                 # Component declarations to inject
@@ -781,7 +778,7 @@ class LinphonePatcher:
                 if "org.jlleitschuh.gradle.ktlint" in content or "ktlint" in content:
                     content = re.sub(r'id\s*\(?["\']org\.jlleitschuh\.gradle\.ktlint["\']\)?', '// ktlint plugin disabled', content)
                     content = re.sub(r'apply\s+plugin:\s*["\']org\.jlleitschuh\.gradle\.ktlint["\']', '// ktlint plugin disabled', content)
-                    content = re.sub(r'ktlint\s*\{[^}]*\}', '// ktlint block disabled', content)
+                    content = re.sub(r'ktlint\s*\{[\s\S]*?\}', '// ktlint block disabled', content)
                     modified = True
 
                 # Disable Android lint abort on error (using regex word boundary to avoid matching ktlint)
