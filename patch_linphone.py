@@ -2,16 +2,21 @@
 """
 patch_linphone.py - Automated Source Patcher for Linphone Android
 New Features:
-1. Max Calls: Configures liblinphone and UI to support up to 10 concurrent calls.
-2. Headless tel: Link Intercept: TelCallInterceptActivity intercepts tel: URIs in background
-   without launching full MainActivity, starts the call, launches floating bubble, and finishes.
-3. Messenger Floating Bubble + Floating Multi-Call Window:
-   - Tapping bubble expands a floating WindowManager overlay window (not the full app).
-   - Real-time row per call (up to 10 lines) with caller info and Active/Hold status.
-   - Row tap switches audio to that call (auto-holds all others).
-   - Per-call buttons: MUTE, HOLD (Pause/Resume), END.
-   - Bottom bar with Conference Merge, Speaker toggle, and Minimize.
-4. Gradle & Build Fixes: Ensures clean, robust compilation in CI environments.
+1. Dynamic Island Capsule Bubble (Screenshot 2):
+   - 280dp x 54dp pill with caller number, real-time status subtitle, and direct Red End button.
+   - Tapping body expands the full floating window.
+2. Floating Multi-Call Window Overlay (Screenshot 1):
+   - Overlays active apps (e.g. Chrome back-office).
+   - Header: ↗ expand to app, Call Counter (e.g. 8 Calls), End All pill, 📞+ add, minimize v.
+   - Body: Scrollable rows with green border (#4CAF50) on active call, (Active)/(Calling...)/(On Hold) states,
+     one-tap auto-hold row switching, individual row hangup buttons.
+   - Bottom Bar: Large red hangup, Hold, Mic mute, and Speaker toggle (working in ANY state: Ringing/Calling/Connected).
+3. Defensive Hooks:
+   - Suppresses CallActivity popping up full-screen via moveTaskToBack(true) + finish().
+   - Suppresses fullScreenIntent in NotificationsManager.
+4. Duplicate Dial Prevention & Debounce:
+   - 2.0s debounce & in-progress call check in TelCallInterceptActivity.
+5. Max Calls: 10 concurrent lines support.
 """
 
 import os
@@ -23,7 +28,10 @@ from pathlib import Path
 # MultiCallHelper.kt template
 MULTICALL_HELPER_KT = '''package org.linphone.multicall
 
+import android.content.Context
+import android.media.AudioManager
 import org.linphone.core.Address
+import org.linphone.core.AudioDevice
 import org.linphone.core.Call
 import org.linphone.core.Core
 import org.linphone.core.tools.Log
@@ -43,10 +51,6 @@ object MultiCallHelper {
         }
     }
 
-    /**
-     * Initiates an outgoing call in the background.
-     * If another call is currently active, it automatically holds it first.
-     */
     fun makeOutgoingCall(core: Core, destination: String): Call? {
         try {
             applyMaxCalls(core)
@@ -57,8 +61,9 @@ object MultiCallHelper {
             }
 
             val address = core.interpretUrl(destination, true) ?: core.createAddress(destination)
+            val params = core.createCallParams(null)
+
             val call = if (address != null) {
-                val params = core.createCallParams(null)
                 if (params != null) core.inviteAddressWithParams(address, params) else core.inviteAddress(address)
             } else {
                 core.invite(destination)
@@ -71,22 +76,6 @@ object MultiCallHelper {
         }
     }
 
-    fun answerAndHoldActive(core: Core, incomingCall: Call) {
-        try {
-            val current = core.currentCall
-            if (current != null && current != incomingCall && current.state == Call.State.StreamsRunning) {
-                current.pause()
-            }
-            incomingCall.accept()
-        } catch (e: Exception) {
-            Log.e("[MultiCallHelper] Failed to answer and hold: ${e.message}")
-        }
-    }
-
-    /**
-     * Switches audio focus to the clicked call.
-     * Pauses all other calls and resumes the target call.
-     */
     fun switchToCall(core: Core, targetCall: Call) {
         try {
             for (call in core.calls) {
@@ -97,7 +86,7 @@ object MultiCallHelper {
             if (targetCall.state == Call.State.Paused || targetCall.state == Call.State.Pausing) {
                 targetCall.resume()
             }
-            Log.i("[MultiCallHelper] Switched audio focus to call: ${targetCall.remoteAddress.asStringUriOnly()}")
+            Log.i("[MultiCallHelper] Switched audio focus to call: ${targetCall.remoteAddress?.asStringUriOnly()}")
         } catch (e: Exception) {
             Log.e("[MultiCallHelper] Failed switching to call: ${e.message}")
         }
@@ -115,10 +104,19 @@ object MultiCallHelper {
         }
     }
 
+    fun terminateAllCalls(core: Core) {
+        try {
+            for (call in core.calls) {
+                call.terminate()
+            }
+        } catch (e: Exception) {
+            Log.e("[MultiCallHelper] Error terminating all calls: ${e.message}")
+        }
+    }
+
     fun mergeAllCallsToConference(core: Core) {
         try {
             if (core.callsNb > 1) {
-                Log.i("[MultiCallHelper] Merging ${core.callsNb} calls into conference")
                 core.addAllToConference()
             }
         } catch (e: Exception) {
@@ -126,40 +124,76 @@ object MultiCallHelper {
         }
     }
 
-    fun getCallSummary(core: Core): String {
-        val total = core.callsNb
-        var active = 0
-        var paused = 0
-        for (call in core.calls) {
-            when (call.state) {
-                Call.State.StreamsRunning -> active++
-                Call.State.Paused, Call.State.Pausing -> paused++
-                else -> {}
+    /**
+     * Speaker toggle working in ANY state (Ringing, Calling, Connected)
+     * using dual-layer hardware AudioManager + Linphone AudioDevice.
+     */
+    fun toggleSpeakerAnytime(context: Context, core: Core): Boolean {
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+        val newSpeakerState = !audioManager.isSpeakerphoneOn
+        audioManager.isSpeakerphoneOn = newSpeakerState
+
+        try {
+            val speaker = core.audioDevices.firstOrNull {
+                it.hasCapability(AudioDevice.Capabilities.CapabilityPlay) && it.type == AudioDevice.Type.Speaker
             }
+            val earpiece = core.audioDevices.firstOrNull {
+                it.hasCapability(AudioDevice.Capabilities.CapabilityPlay) && it.type == AudioDevice.Type.Earpiece
+            }
+            if (newSpeakerState && speaker != null) {
+                core.outputAudioDevice = speaker
+            } else if (!newSpeakerState && earpiece != null) {
+                core.outputAudioDevice = earpiece
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
-        return "Calls: $total/$MAX_CONCURRENT_CALLS ($active Active, $paused Held)"
+        return newSpeakerState
+    }
+
+    fun getCallStateText(call: Call): String {
+        return when (call.state) {
+            Call.State.StreamsRunning -> "(Active)"
+            Call.State.OutgoingInit, Call.State.OutgoingProgress -> "(Calling...)"
+            Call.State.OutgoingRinging -> "(Ringing...)"
+            Call.State.IncomingReceived, Call.State.IncomingEarlyMedia -> "(Incoming...)"
+            Call.State.Paused, Call.State.Pausing -> "(On Hold)"
+            Call.State.End, Call.State.Released -> "(Ending...)"
+            else -> "(${call.state.name})"
+        }
     }
 }
 '''
 
-# TelCallInterceptActivity.kt template
+# TelCallInterceptActivity.kt template (with 2.0s Debounce & Duplicate Dial Protection)
 TEL_CALL_INTERCEPT_ACTIVITY_KT = '''package org.linphone.overlay
 
 import android.app.Activity
-import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import org.linphone.LinphoneApplication
+import org.linphone.core.Call
 import org.linphone.core.tools.Log
 import org.linphone.multicall.MultiCallHelper
 import java.net.URLDecoder
 
 /**
- * TelCallInterceptActivity - Headless interceptor for tel: links.
- * Initiates the Linphone call in background, launches the floating bubble overlay,
- * and immediately finishes without launching the full Linphone main activity.
+ * TelCallInterceptActivity - Headless tel: link interceptor.
+ * Features:
+ * 1. 2.0s Debounce & duplicate dial prevention to avoid accidental multi-dialing.
+ * 2. Initiates call in background, launches Dynamic Island capsule, and finishes without opening MainActivity.
  */
 class TelCallInterceptActivity : Activity() {
+
+    companion object {
+        private var lastDialedTarget: String = ""
+        private var lastDialTimestamp: Long = 0L
+
+        private fun cleanNumber(raw: String): String {
+            return raw.replace(Regex("[^0-9+]"), "")
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -175,7 +209,14 @@ class TelCallInterceptActivity : Activity() {
                 targetNumber = URLDecoder.decode(targetNumber, "UTF-8").trim()
             }
 
-            Log.i("[TelCallIntercept] Intercepted tel: link for: $targetNumber")
+            val cleaned = cleanNumber(targetNumber)
+            val now = System.currentTimeMillis()
+
+            // 1. Debounce check: Ignore identical clicks within 2.0 seconds
+            if (cleaned.isNotEmpty() && cleaned == lastDialedTarget && (now - lastDialTimestamp) < 2000L) {
+                Log.w("[TelCallIntercept] Duplicate click ignored for: $cleaned (within 2s)")
+                return
+            }
 
             if (targetNumber.isNotEmpty()) {
                 val core = try {
@@ -184,18 +225,36 @@ class TelCallInterceptActivity : Activity() {
                     null
                 }
 
+                // 2. Active call check: If already dialing/calling this number, ignore duplicate click
                 if (core != null) {
+                    val alreadyActive = core.calls.any { call ->
+                        val remote = cleanNumber(call.remoteAddress?.username ?: "")
+                        remote == cleaned && (
+                            call.state == Call.State.OutgoingInit ||
+                            call.state == Call.State.OutgoingProgress ||
+                            call.state == Call.State.OutgoingRinging ||
+                            call.state == Call.State.StreamsRunning
+                        )
+                    }
+
+                    if (alreadyActive) {
+                        Log.w("[TelCallIntercept] Call to $cleaned is already in progress. Ignoring duplicate click.")
+                        return
+                    }
+
+                    lastDialedTarget = cleaned
+                    lastDialTimestamp = now
+
                     MultiCallHelper.makeOutgoingCall(core, targetNumber)
                 }
 
-                // Launch floating bubble overlay for outgoing call
-                CallBubbleOverlayService.showBubbleForTarget(this, targetNumber, isIncoming = false)
+                // Launch or update Floating Capsule Overlay
+                CallBubbleOverlayService.showBubbleForTarget(this, targetNumber)
             }
         } catch (e: Exception) {
             e.printStackTrace()
             Log.e("[TelCallIntercept] Error intercepting tel link: ${e.message}")
         } finally {
-            // Immediately finish without animation, keeping user on current screen
             overridePendingTransition(0, 0)
             finish()
         }
@@ -203,7 +262,7 @@ class TelCallInterceptActivity : Activity() {
 }
 '''
 
-# CallBubbleOverlayService.kt template (Full Multi-Call Floating Window)
+# CallBubbleOverlayService.kt template (Dynamic Island Capsule + Screenshot 1 Floating Window)
 CALL_BUBBLE_OVERLAY_SERVICE_KT = '''package org.linphone.overlay
 
 import android.app.*
@@ -230,22 +289,31 @@ import org.linphone.core.Core
 import org.linphone.multicall.MultiCallHelper
 
 /**
- * CallBubbleOverlayService - Draggable Messenger-style chat-head overlay
- * with an expandable floating WindowManager overlay window listing all calls in real time.
+ * CallBubbleOverlayService:
+ * - Dynamic Island Capsule Overlay (Screenshot 2): Number, subtitle status, and direct Red End button.
+ * - Expanded Floating Window Overlay (Screenshot 1): Header with ↗ expand, call counter, End All pill,
+ *   scrollable rows with green border (#4CAF50) on active call, one-tap auto-hold switching,
+ *   and bottom bar (Hangup, Hold, Mute, Speaker anytime).
  */
 class CallBubbleOverlayService : Service() {
 
     private var windowManager: WindowManager? = null
-    private var bubbleHeadView: View? = null
-    private var bubbleParams: WindowManager.LayoutParams? = null
 
+    // Capsule View (Screenshot 2)
+    private var capsuleView: View? = null
+    private var capsuleParams: WindowManager.LayoutParams? = null
+
+    // Expanded Floating Window (Screenshot 1)
     private var floatingWindowView: View? = null
     private var windowParams: WindowManager.LayoutParams? = null
-    private var isWindowExpanded = false
+    private var isExpanded = false
 
     companion object {
         const val CHANNEL_ID = "linphone_call_overlay_channel"
         const val NOTIFICATION_ID = 9021
+
+        @Volatile
+        var isRunning: Boolean = false
 
         const val ACTION_SHOW = "org.linphone.overlay.SHOW"
         const val ACTION_UPDATE = "org.linphone.overlay.UPDATE"
@@ -253,25 +321,22 @@ class CallBubbleOverlayService : Service() {
 
         const val EXTRA_CALLER_NAME = "caller_name"
         const val EXTRA_CALL_COUNT = "call_count"
-        const val EXTRA_IS_INCOMING = "is_incoming"
 
         fun showBubble(context: Context, call: Call, isIncoming: Boolean = false) {
             val intent = Intent(context, CallBubbleOverlayService::class.java).apply {
                 action = ACTION_SHOW
                 val address = call.remoteAddress
-                putExtra(EXTRA_CALLER_NAME, address.displayName ?: address.username ?: "VoIP Call")
+                putExtra(EXTRA_CALLER_NAME, address?.displayName ?: address?.username ?: "VoIP Call")
                 putExtra(EXTRA_CALL_COUNT, call.core.callsNb)
-                putExtra(EXTRA_IS_INCOMING, isIncoming)
             }
             startServiceCompat(context, intent)
         }
 
-        fun showBubbleForTarget(context: Context, destination: String, isIncoming: Boolean = false) {
+        fun showBubbleForTarget(context: Context, destination: String) {
             val intent = Intent(context, CallBubbleOverlayService::class.java).apply {
                 action = ACTION_SHOW
                 putExtra(EXTRA_CALLER_NAME, destination)
                 putExtra(EXTRA_CALL_COUNT, 1)
-                putExtra(EXTRA_IS_INCOMING, isIncoming)
             }
             startServiceCompat(context, intent)
         }
@@ -308,6 +373,7 @@ class CallBubbleOverlayService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        isRunning = true
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, createNotification("Linphone Multi-Call Overlay Active"))
     }
@@ -317,16 +383,16 @@ class CallBubbleOverlayService : Service() {
         when (action) {
             ACTION_DISMISS -> {
                 removeFloatingWindow()
-                removeBubbleHead()
+                removeCapsuleView()
+                isRunning = false
                 stopForeground(true)
                 stopSelf()
                 return START_NOT_STICKY
             }
             ACTION_SHOW, ACTION_UPDATE -> {
                 val callerName = intent?.getStringExtra(EXTRA_CALLER_NAME) ?: "VoIP Call"
-                val callCount = intent?.getIntExtra(EXTRA_CALL_COUNT, 1) ?: 1
-                showOrUpdateBubbleHead(callerName, callCount)
-                if (isWindowExpanded) {
+                showOrUpdateCapsule(callerName)
+                if (isExpanded) {
                     refreshFloatingWindowContent()
                 }
             }
@@ -334,28 +400,45 @@ class CallBubbleOverlayService : Service() {
         return START_STICKY
     }
 
-    private fun showOrUpdateBubbleHead(callerName: String, callCount: Int) {
+    // =========================================================================
+    // DYNAMIC ISLAND CAPSULE OVERLAY (Screenshot 2)
+    // =========================================================================
+    private fun showOrUpdateCapsule(defaultName: String) {
         if (!Settings.canDrawOverlays(this)) return
 
         if (windowManager == null) {
             windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         }
 
-        if (bubbleHeadView == null) {
-            createBubbleHeadView()
+        if (capsuleView == null) {
+            createCapsuleView()
         }
 
-        val badge = bubbleHeadView?.findViewWithTag<TextView>("badge_text")
-        val effectiveCount = try {
-            LinphoneApplication.coreContext.core.callsNb
-        } catch (e: Exception) {
-            callCount
+        val core = try { LinphoneApplication.coreContext.core } catch (e: Exception) { null }
+        val currentCall = core?.currentCall ?: core?.calls?.firstOrNull()
+
+        val primaryTv = capsuleView?.findViewWithTag<TextView>("capsule_primary_text")
+        val subtitleTv = capsuleView?.findViewWithTag<TextView>("capsule_subtitle_text")
+
+        val targetNumber = if (currentCall != null) {
+            val addr = currentCall.remoteAddress
+            addr?.displayName ?: addr?.username ?: defaultName
+        } else {
+            defaultName
         }
-        badge?.text = if (effectiveCount > 1) "$effectiveCount" else ""
-        badge?.visibility = if (effectiveCount > 1) View.VISIBLE else View.GONE
+
+        val statusText = if (currentCall != null) {
+            val stateText = MultiCallHelper.getCallStateText(currentCall)
+            if (core.callsNb > 1) "$stateText • ${core.callsNb} Calls" else stateText
+        } else {
+            "Calling..."
+        }
+
+        primaryTv?.text = targetNumber
+        subtitleTv?.text = statusText
     }
 
-    private fun createBubbleHeadView() {
+    private fun createCapsuleView() {
         val wm = windowManager ?: return
 
         val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -365,64 +448,106 @@ class CallBubbleOverlayService : Service() {
         }
 
         val lp = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
+            dpToPx(280),
+            dpToPx(56),
             layoutType,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
             x = 40
-            y = 220
+            y = 120
         }
-        bubbleParams = lp
+        capsuleParams = lp
 
-        val headContainer = FrameLayout(this)
-        val sizePx = dpToPx(64)
-        headContainer.layoutParams = FrameLayout.LayoutParams(sizePx, sizePx)
+        // Black pill container (cornerRadius 28dp, #F012131A, stroke #33FFFFFF)
+        val pill = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            val bg = GradientDrawable().apply {
+                cornerRadius = dpToPx(28).toFloat()
+                setColor(Color.parseColor("#F012131A"))
+                setStroke(dpToPx(1), Color.parseColor("#33FFFFFF"))
+            }
+            background = bg
+            setPadding(dpToPx(8), dpToPx(6), dpToPx(8), dpToPx(6))
+        }
 
-        // Circular background
-        val circleBg = GradientDrawable().apply {
-            shape = GradientDrawable.OVAL
-            setColor(Color.parseColor("#1B72E8"))
-            setStroke(dpToPx(2), Color.WHITE)
+        // Left Phone Icon in Circle
+        val iconCircle = FrameLayout(this).apply {
+            val iconSize = dpToPx(40)
+            layoutParams = LinearLayout.LayoutParams(iconSize, iconSize)
+            val cBg = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.parseColor("#222430"))
+            }
+            background = cBg
+            val iv = ImageView(this@CallBubbleOverlayService).apply {
+                setImageResource(android.R.drawable.sym_action_call)
+                setColorFilter(Color.parseColor("#4CAF50"))
+                setPadding(dpToPx(10), dpToPx(10), dpToPx(10), dpToPx(10))
+            }
+            addView(iv, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         }
-        val bubbleIcon = ImageView(this).apply {
-            background = circleBg
-            setImageResource(android.R.drawable.sym_action_call)
-            setPadding(dpToPx(14), dpToPx(14), dpToPx(14), dpToPx(14))
-        }
-        headContainer.addView(bubbleIcon, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        pill.addView(iconCircle)
 
-        // Badge at top-right
-        val badgeBg = GradientDrawable().apply {
-            shape = GradientDrawable.OVAL
-            setColor(Color.parseColor("#E53935"))
-            setStroke(dpToPx(1), Color.WHITE)
+        // Center Column: Number + Subtitle
+        val textLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(dpToPx(10), 0, dpToPx(8), 0)
+            }
         }
-        val badgeTv = TextView(this).apply {
-            tag = "badge_text"
-            background = badgeBg
+        val primaryTv = TextView(this).apply {
+            tag = "capsule_primary_text"
+            text = "+8801610880005"
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
             setTypeface(null, Typeface.BOLD)
-            gravity = Gravity.CENTER
-            visibility = View.GONE
+            maxLines = 1
         }
-        val badgeSize = dpToPx(22)
-        headContainer.addView(badgeTv, FrameLayout.LayoutParams(badgeSize, badgeSize).apply {
-            gravity = Gravity.TOP or Gravity.END
-        })
+        val subtitleTv = TextView(this).apply {
+            tag = "capsule_subtitle_text"
+            text = "Calling..."
+            setTextColor(Color.parseColor("#A0A5B5"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            maxLines = 1
+        }
+        textLayout.addView(primaryTv)
+        textLayout.addView(subtitleTv)
+        pill.addView(textLayout)
 
-        // Touch & Drag Listener
+        // Right Direct Red Circular End Button (Screenshot 2)
+        val endCircle = FrameLayout(this).apply {
+            val btnSize = dpToPx(40)
+            layoutParams = LinearLayout.LayoutParams(btnSize, btnSize)
+            val endBg = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.parseColor("#E53935"))
+            }
+            background = endBg
+            val endIv = ImageView(this@CallBubbleOverlayService).apply {
+                setImageResource(android.R.drawable.ic_menu_close_clear_cancel)
+                setColorFilter(Color.WHITE)
+                setPadding(dpToPx(10), dpToPx(10), dpToPx(10), dpToPx(10))
+            }
+            addView(endIv, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+            setOnClickListener {
+                terminateActiveOrLatestCall()
+            }
+        }
+        pill.addView(endCircle)
+
+        // Touch & Drag Handling on Capsule Body (Click toggles Screenshot 1 Floating Window)
         var initialX = 0
         var initialY = 0
         var initialTouchX = 0f
         var initialTouchY = 0f
         var isClick = false
 
-        headContainer.setOnTouchListener { _, event ->
-            val curParams = bubbleParams ?: return@setOnTouchListener false
+        pill.setOnTouchListener { _, event ->
+            val curParams = capsuleParams ?: return@setOnTouchListener false
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
                     initialX = curParams.x
@@ -440,12 +565,11 @@ class CallBubbleOverlayService : Service() {
                     }
                     curParams.x = initialX + dx
                     curParams.y = initialY + dy
-                    wm.updateViewLayout(headContainer, curParams)
+                    wm.updateViewLayout(pill, curParams)
                     true
                 }
                 MotionEvent.ACTION_UP -> {
                     if (isClick) {
-                        // Tapping bubble toggles floating WindowManager overlay window
                         toggleFloatingWindow()
                     }
                     true
@@ -454,12 +578,30 @@ class CallBubbleOverlayService : Service() {
             }
         }
 
-        bubbleHeadView = headContainer
-        wm.addView(headContainer, lp)
+        capsuleView = pill
+        wm.addView(pill, lp)
     }
 
+    private fun terminateActiveOrLatestCall() {
+        try {
+            val core = LinphoneApplication.coreContext.core
+            val call = core.currentCall ?: core.calls.firstOrNull()
+            call?.terminate()
+            if (core.callsNb <= 1) {
+                dismissBubble(this)
+            } else {
+                updateBubble(this, core)
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    // =========================================================================
+    // EXPANDED FLOATING WINDOW OVERLAY (Screenshot 1)
+    // =========================================================================
     private fun toggleFloatingWindow() {
-        if (isWindowExpanded) {
+        if (isExpanded) {
             removeFloatingWindow()
         } else {
             showFloatingWindow()
@@ -476,67 +618,94 @@ class CallBubbleOverlayService : Service() {
             WindowManager.LayoutParams.TYPE_PHONE
         }
 
-        val widthPx = dpToPx(340)
         val lp = WindowManager.LayoutParams(
-            widthPx,
+            dpToPx(340),
             WindowManager.LayoutParams.WRAP_CONTENT,
             layoutType,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = Math.max(20, (bubbleParams?.x ?: 40))
-            y = (bubbleParams?.y ?: 220) + dpToPx(70)
+            x = Math.max(20, (capsuleParams?.x ?: 40))
+            y = (capsuleParams?.y ?: 120) + dpToPx(64)
         }
         windowParams = lp
 
-        // Root floating card
+        // Root floating card (cornerRadius 18dp, #F5181923, stroke #44FFFFFF)
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             val bg = GradientDrawable().apply {
-                cornerRadius = dpToPx(16).toFloat()
-                setColor(Color.parseColor("#F01E1E2E"))
-                setStroke(dpToPx(1), Color.parseColor("#55FFFFFF"))
+                cornerRadius = dpToPx(18).toFloat()
+                setColor(Color.parseColor("#F5181923"))
+                setStroke(dpToPx(1), Color.parseColor("#44FFFFFF"))
             }
             background = bg
-            setPadding(dpToPx(14), dpToPx(12), dpToPx(14), dpToPx(12))
+            setPadding(dpToPx(14), dpToPx(14), dpToPx(14), dpToPx(14))
         }
 
-        // Header
+        // Header Bar: ↗ Expand, Call Counter, End All Pill, 📞+ Add, Minimize v
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dpToPx(10))
         }
-        val titleLayout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+
+        val expandAppBtn = TextView(this).apply {
+            text = "↗"
+            setTextColor(Color.parseColor("#B0B3C6"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setPadding(dpToPx(4), dpToPx(2), dpToPx(8), dpToPx(2))
+            setOnClickListener {
+                openLinphoneAppExplicitly()
+            }
         }
-        val titleTv = TextView(this).apply {
-            text = "Linphone Multi-Call"
+        header.addView(expandAppBtn)
+
+        val counterTv = TextView(this).apply {
+            tag = "window_call_counter"
+            text = "1 Calls"
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
             setTypeface(null, Typeface.BOLD)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
-        val subtitleTv = TextView(this).apply {
-            tag = "window_subtitle"
-            text = "Up to 10 Concurrent Lines"
-            setTextColor(Color.parseColor("#B0B3C6"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-        }
-        titleLayout.addView(titleTv)
-        titleLayout.addView(subtitleTv)
-        header.addView(titleLayout)
+        header.addView(counterTv)
 
-        val closeBtn = TextView(this).apply {
-            text = "✕"
-            setTextColor(Color.parseColor("#E0E0E0"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-            setPadding(dpToPx(8), dpToPx(4), dpToPx(8), dpToPx(4))
+        val endAllBtn = TextView(this).apply {
+            text = "End All"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTypeface(null, Typeface.BOLD)
+            val btnBg = GradientDrawable().apply {
+                cornerRadius = dpToPx(12).toFloat()
+                setColor(Color.parseColor("#E53935"))
+            }
+            background = btnBg
+            setPadding(dpToPx(10), dpToPx(4), dpToPx(10), dpToPx(4))
+            setOnClickListener {
+                try {
+                    val core = LinphoneApplication.coreContext.core
+                    MultiCallHelper.terminateAllCalls(core)
+                    dismissBubble(this@CallBubbleOverlayService)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+        }
+        header.addView(endAllBtn)
+
+        val minimizeBtn = TextView(this).apply {
+            text = " v "
+            setTextColor(Color.parseColor("#B0B3C6"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            setTypeface(null, Typeface.BOLD)
+            setPadding(dpToPx(10), dpToPx(2), dpToPx(4), dpToPx(2))
             setOnClickListener {
                 removeFloatingWindow()
             }
         }
-        header.addView(closeBtn)
+        header.addView(minimizeBtn)
+
         card.addView(header)
 
         // Scrollable Call Rows List
@@ -547,65 +716,138 @@ class CallBubbleOverlayService : Service() {
         val callRowsContainer = LinearLayout(this).apply {
             tag = "call_rows_container"
             orientation = LinearLayout.VERTICAL
-            setPadding(0, dpToPx(8), 0, dpToPx(8))
         }
         scrollView.addView(callRowsContainer)
         card.addView(scrollView)
 
-        // Bottom Controls
+        // Bottom Controls Bar: Large Red Hangup, Hold, Mic Mute, Speaker Anytime
         val bottomBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(0, dpToPx(8), 0, 0)
+            setPadding(0, dpToPx(12), 0, dpToPx(4))
         }
 
-        val mergeBtn = TextView(this).apply {
-            text = "👥 Conference"
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            val btnBg = GradientDrawable().apply {
-                cornerRadius = dpToPx(8).toFloat()
-                setColor(Color.parseColor("#43A047"))
+        // 1. Large Red Circular Hangup
+        val hangupBtn = FrameLayout(this).apply {
+            val size = dpToPx(48)
+            layoutParams = LinearLayout.LayoutParams(size, size).apply {
+                setMargins(dpToPx(8), 0, dpToPx(8), 0)
             }
-            background = btnBg
-            setPadding(dpToPx(12), dpToPx(8), dpToPx(12), dpToPx(8))
+            val bg = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.parseColor("#E53935"))
+            }
+            background = bg
+            val iv = ImageView(this@CallBubbleOverlayService).apply {
+                setImageResource(android.R.drawable.ic_menu_close_clear_cancel)
+                setColorFilter(Color.WHITE)
+                setPadding(dpToPx(12), dpToPx(12), dpToPx(12), dpToPx(12))
+            }
+            addView(iv, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+            setOnClickListener {
+                terminateActiveOrLatestCall()
+                refreshFloatingWindowContent()
+            }
+        }
+        bottomBar.addView(hangupBtn)
+
+        // 2. Hold Button
+        val holdBtn = FrameLayout(this).apply {
+            val size = dpToPx(44)
+            layoutParams = LinearLayout.LayoutParams(size, size).apply {
+                setMargins(dpToPx(8), 0, dpToPx(8), 0)
+            }
+            val bg = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.parseColor("#2E303E"))
+            }
+            background = bg
+            val tv = TextView(this@CallBubbleOverlayService).apply {
+                text = "Hold"
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                gravity = Gravity.CENTER
+            }
+            addView(tv, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
             setOnClickListener {
                 try {
                     val core = LinphoneApplication.coreContext.core
-                    MultiCallHelper.mergeAllCallsToConference(core)
-                    refreshFloatingWindowContent()
+                    val call = core.currentCall ?: core.calls.firstOrNull()
+                    if (call != null) {
+                        MultiCallHelper.toggleCallHold(call)
+                        refreshFloatingWindowContent()
+                    }
                 } catch (e: Exception) {
                     e.printStackTrace()
                 }
             }
         }
-        bottomBar.addView(mergeBtn)
+        bottomBar.addView(holdBtn)
 
-        val spacer = View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(dpToPx(10), 1)
-        }
-        bottomBar.addView(spacer)
-
-        val speakerBtn = TextView(this).apply {
-            text = "🔊 Speaker"
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            val btnBg = GradientDrawable().apply {
-                cornerRadius = dpToPx(8).toFloat()
-                setColor(Color.parseColor("#3949AB"))
+        // 3. Mic Mute Button
+        val micBtn = FrameLayout(this).apply {
+            tag = "bottom_mic_button"
+            val size = dpToPx(44)
+            layoutParams = LinearLayout.LayoutParams(size, size).apply {
+                setMargins(dpToPx(8), 0, dpToPx(8), 0)
             }
-            background = btnBg
-            setPadding(dpToPx(12), dpToPx(8), dpToPx(12), dpToPx(8))
+            val bg = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.parseColor("#2E303E"))
+            }
+            background = bg
+            val tv = TextView(this@CallBubbleOverlayService).apply {
+                tag = "bottom_mic_text"
+                text = "Mic"
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                gravity = Gravity.CENTER
+            }
+            addView(tv, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
             setOnClickListener {
                 try {
                     val core = LinphoneApplication.coreContext.core
-                    val speaker = core.audioDevices.firstOrNull { it.hasCapability(org.linphone.core.AudioDevice.Capabilities.CapabilityPlay) && it.type == org.linphone.core.AudioDevice.Type.Speaker }
-                    val earpiece = core.audioDevices.firstOrNull { it.hasCapability(org.linphone.core.AudioDevice.Capabilities.CapabilityPlay) && it.type == org.linphone.core.AudioDevice.Type.Earpiece }
-                    if (core.outputAudioDevice?.type == org.linphone.core.AudioDevice.Type.Speaker && earpiece != null) {
-                        core.outputAudioDevice = earpiece
-                    } else if (speaker != null) {
-                        core.outputAudioDevice = speaker
+                    val call = core.currentCall ?: core.calls.firstOrNull()
+                    if (call != null) {
+                        call.microphoneMuted = !call.microphoneMuted
+                        val micTv = findViewWithTag<TextView>("bottom_mic_text")
+                        micTv?.text = if (call.microphoneMuted) "Muted" else "Mic"
+                        bg.setColor(if (call.microphoneMuted) Color.parseColor("#E53935") else Color.parseColor("#2E303E"))
                     }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+        }
+        bottomBar.addView(micBtn)
+
+        // 4. Speaker Button (Works in ANY state: Ringing, Calling, Connected)
+        val speakerBtn = FrameLayout(this).apply {
+            tag = "bottom_speaker_button"
+            val size = dpToPx(44)
+            layoutParams = LinearLayout.LayoutParams(size, size).apply {
+                setMargins(dpToPx(8), 0, dpToPx(8), 0)
+            }
+            val bg = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.parseColor("#2E303E"))
+            }
+            background = bg
+            val tv = TextView(this@CallBubbleOverlayService).apply {
+                tag = "bottom_speaker_text"
+                text = "Spk"
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                gravity = Gravity.CENTER
+            }
+            addView(tv, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+            setOnClickListener {
+                try {
+                    val core = LinphoneApplication.coreContext.core
+                    val isSpk = MultiCallHelper.toggleSpeakerAnytime(this@CallBubbleOverlayService, core)
+                    val spkTv = findViewWithTag<TextView>("bottom_speaker_text")
+                    spkTv?.text = if (isSpk) "Spk On" else "Spk"
+                    bg.setColor(if (isSpk) Color.parseColor("#1E88E5") else Color.parseColor("#2E303E"))
                 } catch (e: Exception) {
                     e.printStackTrace()
                 }
@@ -617,7 +859,7 @@ class CallBubbleOverlayService : Service() {
 
         floatingWindowView = card
         wm.addView(card, lp)
-        isWindowExpanded = true
+        isExpanded = true
 
         refreshFloatingWindowContent()
     }
@@ -626,11 +868,7 @@ class CallBubbleOverlayService : Service() {
         val container = floatingWindowView?.findViewWithTag<LinearLayout>("call_rows_container") ?: return
         container.removeAllViews()
 
-        val core = try {
-            LinphoneApplication.coreContext.core
-        } catch (e: Exception) {
-            null
-        }
+        val core = try { LinphoneApplication.coreContext.core } catch (e: Exception) { null }
 
         if (core == null || core.callsNb == 0) {
             val emptyTv = TextView(this).apply {
@@ -644,10 +882,10 @@ class CallBubbleOverlayService : Service() {
             return
         }
 
-        val subtitle = floatingWindowView?.findViewWithTag<TextView>("window_subtitle")
-        subtitle?.text = MultiCallHelper.getCallSummary(core)
+        val counterTv = floatingWindowView?.findViewWithTag<TextView>("window_call_counter")
+        counterTv?.text = "${core.callsNb} Calls"
 
-        // Iterate through all calls (up to 10)
+        // Render each call row with green border (#4CAF50) on active call
         for (call in core.calls) {
             val isStreamsRunning = call.state == Call.State.StreamsRunning
             val isPaused = call.state == Call.State.Paused || call.state == Call.State.Pausing
@@ -656,132 +894,81 @@ class CallBubbleOverlayService : Service() {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
                 val rowBg = GradientDrawable().apply {
-                    cornerRadius = dpToPx(8).toFloat()
-                    setColor(if (isStreamsRunning) Color.parseColor("#2E3440") else Color.parseColor("#1F232A"))
-                    setStroke(dpToPx(1), if (isStreamsRunning) Color.parseColor("#4C566A") else Color.TRANSPARENT)
+                    cornerRadius = dpToPx(10).toFloat()
+                    setColor(if (isStreamsRunning) Color.parseColor("#232F27") else Color.parseColor("#1C1E28"))
+                    // Active call gets prominent green border outline (#4CAF50)
+                    setStroke(dpToPx(if (isStreamsRunning) 2 else 1), if (isStreamsRunning) Color.parseColor("#4CAF50") else Color.parseColor("#2A2C3A"))
                 }
                 background = rowBg
-                setPadding(dpToPx(8), dpToPx(6), dpToPx(8), dpToPx(6))
+                setPadding(dpToPx(10), dpToPx(8), dpToPx(8), dpToPx(8))
                 layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
                     setMargins(0, dpToPx(3), 0, dpToPx(3))
                 }
-                // Tapping row switches audio to this call
+                // Tapping any row switches audio focus and auto-holds others
                 setOnClickListener {
                     MultiCallHelper.switchToCall(core, call)
                     refreshFloatingWindowContent()
+                    showOrUpdateCapsule(call.remoteAddress?.username ?: "VoIP Call")
                 }
             }
-
-            // State Indicator Dot
-            val dot = View(this).apply {
-                val dotColor = when {
-                    isStreamsRunning -> Color.parseColor("#4CAF50")
-                    isPaused -> Color.parseColor("#FFA000")
-                    else -> Color.parseColor("#2196F3")
-                }
-                val dotBg = GradientDrawable().apply {
-                    shape = GradientDrawable.OVAL
-                    setColor(dotColor)
-                }
-                background = dotBg
-                layoutParams = LinearLayout.LayoutParams(dpToPx(10), dpToPx(10)).apply {
-                    setMargins(0, 0, dpToPx(8), 0)
-                }
-            }
-            row.addView(dot)
 
             // Info Column
             val infoLayout = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             }
+            val stateText = MultiCallHelper.getCallStateText(call)
+            val stateTv = TextView(this).apply {
+                text = stateText
+                setTextColor(if (isStreamsRunning) Color.parseColor("#4CAF50") else Color.parseColor("#FFA000"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                setTypeface(null, Typeface.BOLD)
+            }
             val address = call.remoteAddress
-            val nameTv = TextView(this).apply {
-                text = address.displayName ?: address.username ?: "Unknown"
+            val numberTv = TextView(this).apply {
+                text = address?.displayName ?: address?.username ?: "Unknown"
                 setTextColor(Color.WHITE)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
                 setTypeface(null, if (isStreamsRunning) Typeface.BOLD else Typeface.NORMAL)
             }
-            val statusTv = TextView(this).apply {
-                text = if (isStreamsRunning) "ACTIVE" else if (isPaused) "ON HOLD" else call.state.name
-                setTextColor(if (isStreamsRunning) Color.parseColor("#81C784") else Color.parseColor("#FFB74D"))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            }
-            infoLayout.addView(nameTv)
-            infoLayout.addView(statusTv)
+            infoLayout.addView(stateTv)
+            infoLayout.addView(numberTv)
             row.addView(infoLayout)
 
-            // Button 1: MUTE
-            val muteBtn = TextView(this).apply {
-                text = if (call.microphoneMuted) "Muted" else "Mute"
-                setTextColor(Color.WHITE)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
-                val mBg = GradientDrawable().apply {
-                    cornerRadius = dpToPx(6).toFloat()
-                    setColor(if (call.microphoneMuted) Color.parseColor("#D08770") else Color.parseColor("#4A4A5A"))
-                }
-                background = mBg
-                setPadding(dpToPx(6), dpToPx(4), dpToPx(6), dpToPx(4))
-                setOnClickListener {
-                    try {
-                        val isMuted = call.microphoneMuted
-                        call.microphoneMuted = !isMuted
-                        text = if (!isMuted) "Muted" else "Mute"
-                        (background as? GradientDrawable)?.setColor(if (!isMuted) Color.parseColor("#D08770") else Color.parseColor("#4A4A5A"))
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
-                }
-            }
-            row.addView(muteBtn)
-
-            val bSpacer1 = View(this).apply { layoutParams = LinearLayout.LayoutParams(dpToPx(4), 1) }
-            row.addView(bSpacer1)
-
-            // Button 2: HOLD / RESUME
-            val holdBtn = TextView(this).apply {
-                text = if (isStreamsRunning) "Hold" else "Resume"
-                setTextColor(Color.WHITE)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
-                val hBg = GradientDrawable().apply {
-                    cornerRadius = dpToPx(6).toFloat()
-                    setColor(if (isStreamsRunning) Color.parseColor("#F57C00") else Color.parseColor("#388E3C"))
-                }
-                background = hBg
-                setPadding(dpToPx(6), dpToPx(4), dpToPx(6), dpToPx(4))
-                setOnClickListener {
-                    MultiCallHelper.toggleCallHold(call)
-                    refreshFloatingWindowContent()
-                }
-            }
-            row.addView(holdBtn)
-
-            val bSpacer2 = View(this).apply { layoutParams = LinearLayout.LayoutParams(dpToPx(4), 1) }
-            row.addView(bSpacer2)
-
-            // Button 3: END
-            val endBtn = TextView(this).apply {
-                text = "End"
-                setTextColor(Color.WHITE)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
-                val eBg = GradientDrawable().apply {
-                    cornerRadius = dpToPx(6).toFloat()
-                    setColor(Color.parseColor("#D32F2F"))
-                }
-                background = eBg
-                setPadding(dpToPx(6), dpToPx(4), dpToPx(6), dpToPx(4))
+            // Individual End button '✕' on each row
+            val endRowBtn = TextView(this).apply {
+                text = "✕"
+                setTextColor(Color.parseColor("#E53935"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+                setTypeface(null, Typeface.BOLD)
+                setPadding(dpToPx(8), dpToPx(4), dpToPx(8), dpToPx(4))
                 setOnClickListener {
                     try {
                         call.terminate()
-                        container.postDelayed({ refreshFloatingWindowContent() }, 300)
+                        container.postDelayed({
+                            refreshFloatingWindowContent()
+                            if (core.callsNb == 0) dismissBubble(this@CallBubbleOverlayService)
+                        }, 250)
                     } catch (e: Exception) {
                         e.printStackTrace()
                     }
                 }
             }
-            row.addView(endBtn)
+            row.addView(endRowBtn)
 
             container.addView(row)
+        }
+    }
+
+    private fun openLinphoneAppExplicitly() {
+        try {
+            val pm = packageManager
+            val intent = pm.getLaunchIntentForPackage(packageName)?.apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+            }
+            if (intent != null) startActivity(intent)
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
     }
 
@@ -790,20 +977,21 @@ class CallBubbleOverlayService : Service() {
             windowManager?.removeView(it)
             floatingWindowView = null
         }
-        isWindowExpanded = false
+        isExpanded = false
     }
 
-    private fun removeBubbleHead() {
-        bubbleHeadView?.let {
+    private fun removeCapsuleView() {
+        capsuleView?.let {
             windowManager?.removeView(it)
-            bubbleHeadView = null
+            capsuleView = null
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        isRunning = false
         removeFloatingWindow()
-        removeBubbleHead()
+        removeCapsuleView()
     }
 
     private fun dpToPx(dp: Int): Int {
@@ -817,7 +1005,7 @@ class CallBubbleOverlayService : Service() {
                 "Linphone Call Overlay",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Floating overlay notification for active VoIP calls"
+                description = "Floating Dynamic Island overlay for active VoIP calls"
             }
             val manager = getSystemService(NotificationManager::class.java)
             manager?.createNotificationChannel(channel)
@@ -845,7 +1033,7 @@ class LinphonePatcher:
         print(f"[Patcher] Target directory: {self.target_dir}")
 
     def patch_all(self):
-        print("=== Starting Linphone Custom Patcher (10 Calls + Headless Tel + Overlay Window) ===")
+        print("=== Starting Linphone Custom Patcher (Dynamic Island + Floating Window + Defensive Hooks) ===")
         self.patch_config_files()
         self.patch_manifest()
         self.inject_multicall_helper()
@@ -853,6 +1041,7 @@ class LinphonePatcher:
         self.inject_overlay_service()
         self.patch_core_context()
         self.patch_notifications_manager()
+        self.patch_call_activity_defensive()
         self.patch_gradle_build()
         print("=== Linphone Custom Patcher Completed Successfully ===")
 
@@ -883,7 +1072,6 @@ class LinphonePatcher:
                     except Exception as e:
                         print(f"  -> Warning: Failed patching {file_path}: {e}")
 
-        # Ensure default exists
         assets_dir = self.target_dir / "app" / "src" / "main" / "assets"
         assets_dir.mkdir(parents=True, exist_ok=True)
         default_rc = assets_dir / "linphonerc_default"
@@ -900,7 +1088,7 @@ class LinphonePatcher:
                 content = manifest_path.read_text(encoding="utf-8")
                 modified = False
 
-                # 1. Override/disable conflicting scheme="tel" in other activities so TelCallInterceptActivity handles all tel: links
+                # 1. Disable conflicting scheme="tel" in existing activities so TelCallInterceptActivity handles all
                 if '<data android:scheme="tel"' in content:
                     content = re.sub(
                         r'<data\s+android:scheme="tel"\s*/>',
@@ -909,16 +1097,15 @@ class LinphonePatcher:
                     )
                     modified = True
 
-                # 2. Permissions
-                permissions = [
-                    '<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />',
-                    '<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />',
-                    '<uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />'
-                ]
-                for perm in permissions:
-                    if perm not in content and "<application" in content:
-                        content = content.replace("<application", f"{perm}\n    <application", 1)
-                        modified = True
+                # 2. Permissions directly above <application
+                permissions = '''
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
+'''
+                if "SYSTEM_ALERT_WINDOW" not in content:
+                    content = content.replace("<application", f"{permissions}\n    <application", 1)
+                    modified = True
 
                 # 3. TelCallInterceptActivity + CallBubbleOverlayService
                 components = '''
@@ -941,7 +1128,7 @@ class LinphonePatcher:
             </intent-filter>
         </activity>
 
-        <!-- Messenger Floating Bubble Overlay Service with Multi-Call Window -->
+        <!-- Dynamic Island Capsule & Floating Multi-Call Overlay Service -->
         <service
             android:name="org.linphone.overlay.CallBubbleOverlayService"
             android:enabled="true"
@@ -985,6 +1172,45 @@ class LinphonePatcher:
         file_path.write_text(CALL_BUBBLE_OVERLAY_SERVICE_KT, encoding="utf-8")
         print(f"  -> Written: {file_path.relative_to(self.target_dir)}")
 
+    def patch_call_activity_defensive(self):
+        """
+        Defensive Hook: Suppress CallActivity from taking over full-screen
+        when CallBubbleOverlayService is active.
+        """
+        print("[Patcher] Injecting defensive hooks into CallActivity...")
+        call_activities = list(self.target_dir.glob("**/CallActivity.kt")) + list(self.target_dir.glob("**/CallActivity.java"))
+
+        for file_path in call_activities:
+            try:
+                content = file_path.read_text(encoding="utf-8")
+                if "CallBubbleOverlayService.isRunning" in content:
+                    continue
+
+                if file_path.suffix == ".kt":
+                    hook = '''
+        // Defensive Hook: If floating overlay bubble is active, move task to back and finish
+        if (org.linphone.overlay.CallBubbleOverlayService.isRunning) {
+            moveTaskToBack(true)
+            finish()
+            return
+        }
+'''
+                    # Inject at start of onCreate and onResume
+                    content = re.sub(
+                        r"(override\s+fun\s+onCreate[^{]*\{)",
+                        r"\1" + hook,
+                        content
+                    )
+                    content = re.sub(
+                        r"(override\s+fun\s+onResume[^{]*\{)",
+                        r"\1" + hook,
+                        content
+                    )
+                    file_path.write_text(content, encoding="utf-8")
+                    print(f"  -> Injected CallActivity defensive suppression: {file_path.relative_to(self.target_dir)}")
+            except Exception as e:
+                print(f"  -> Warning: Failed patching CallActivity {file_path}: {e}")
+
     def patch_core_context(self):
         """Enforce core.maxCalls = 10 in CoreContext.kt / LinphoneManager."""
         print("[Patcher] Patching CoreContext / LinphoneManager for maxCalls = 10...")
@@ -1017,7 +1243,7 @@ class LinphonePatcher:
                 print(f"  -> Warning: Could not patch {file_path}: {e}")
 
     def patch_notifications_manager(self):
-        """Hook CallBubbleOverlayService into NotificationsManager onCallStateChanged."""
+        """Hook CallBubbleOverlayService into NotificationsManager and suppress fullScreenIntent."""
         print("[Patcher] Hooking CallBubbleOverlayService into NotificationsManager...")
         notif_managers = list(self.target_dir.glob("**/NotificationsManager.kt")) + \
                          list(self.target_dir.glob("**/NotificationsManager.java"))
@@ -1029,21 +1255,29 @@ class LinphonePatcher:
                     continue
 
                 if file_path.suffix == ".kt":
-                    import_stmt = "import org.linphone.overlay.CallBubbleOverlayService\nimport org.linphone.multicall.MultiCallHelper\n"
-                    if "package " in content:
-                        content = re.sub(r"(package\s+[^\n]+)", r"\1\n\n" + import_stmt, content, count=1)
-                    else:
-                        content = import_stmt + content
+                    import_stmt = "\nimport org.linphone.overlay.CallBubbleOverlayService\nimport org.linphone.multicall.MultiCallHelper\n"
+                    # Insert imports below package statement
+                    content = re.sub(r"(package\s+[^\n]+)", r"\1" + import_stmt, content, count=1)
+
+                    # Suppress fullScreenIntent to prevent main app pop-ups over user screen
+                    content = re.sub(
+                        r"(\.setFullScreenIntent\([^)]+\))",
+                        r"/* \1 disabled for floating overlay mode */",
+                        content
+                    )
 
                     if "override fun onCallStateChanged" in content:
                         hook_code = '''
-        // Custom Hook: Trigger Messenger Floating Bubble Overlay
+        // Custom Hook: Trigger Dynamic Island Capsule Overlay
         try {
             when (call.state) {
                 org.linphone.core.Call.State.IncomingReceived,
                 org.linphone.core.Call.State.IncomingEarlyMedia -> {
                     CallBubbleOverlayService.showBubble(context, call, isIncoming = true)
                 }
+                org.linphone.core.Call.State.OutgoingInit,
+                org.linphone.core.Call.State.OutgoingProgress,
+                org.linphone.core.Call.State.OutgoingRinging,
                 org.linphone.core.Call.State.Connected,
                 org.linphone.core.Call.State.StreamsRunning,
                 org.linphone.core.Call.State.Paused -> {
@@ -1099,7 +1333,7 @@ class LinphonePatcher:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Patch Linphone Android for 10 calls, Headless tel: intercept & Floating Multi-Call Window.")
+    parser = argparse.ArgumentParser(description="Patch Linphone Android for 10 calls, Dynamic Island Capsule & Floating Multi-Call Window.")
     parser.add_argument("--target", default="linphone-android", help="Path to linphone-android project root directory")
     args = parser.parse_args()
 
