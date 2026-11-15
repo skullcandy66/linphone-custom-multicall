@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       linphone_branch:
-        description: 'Linphone Android Branch/Tag (e.g. release/5.2, release/5.1, master)'
+        description: 'Linphone Android Branch/Tag (default: master)'
         required: false
-        default: 'release/5.2'
+        default: 'master'
       build_type:
         description: 'Build Type (debug or release)'
         required: false
@@ -37,55 +37,43 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
-      - name: Accept Android SDK Licenses
-        run: |
-          mkdir -p "$ANDROID_HOME/licenses" || true
-          printf "89337d1250775148b1dd817016b918fa7903e093\n24333f8a63b6825ea9c5514f83c2829b004d1fee\nd56f5187479451eabf01fb78af6dfcb131a6481e\n84831b9409646a33ee33ee30217559483737b666\n" > "$ANDROID_HOME/licenses/android-sdk-license" || true
-          printf "84831b9409646a33ee33ee30217559483737b666\n" > "$ANDROID_HOME/licenses/android-sdk-preview-license" || true
-          printf "7907f711f11926ee4ca99b4070ec07ac5d259424\n" > "$ANDROID_HOME/licenses/android-sdk-arm-dbt-license" || true
-          printf "601085b94cd77f0b54ff864069554494414c4d6d\n" > "$ANDROID_HOME/licenses/android-googletv-license" || true
-          printf "33b6a2b6492040b8007ea52c3f0447abec801192\n" > "$ANDROID_HOME/licenses/google-gdk-license" || true
-          printf "e9acab583f1529a499d0fbde8d402a7b0873d04d\n" > "$ANDROID_HOME/licenses/mips-android-sysimage-license" || true
-          SDKMANAGER=$(find "$ANDROID_HOME" -name sdkmanager -type f | head -n 1)
-          if [ -n "$SDKMANAGER" ]; then
-            yes | "$SDKMANAGER" --licenses || true
-            yes | "$SDKMANAGER" "build-tools;33.0.1" "platforms;android-33" || true
-          fi
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: 11076708
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Clone Linphone Android Source
+      - name: Clone Linphone Android Source (Latest Master)
         run: |
-          TARGET_BRANCH="${{ github.event.inputs.linphone_branch || 'release/5.2' }}"
-          echo "Attempting to clone branch: $TARGET_BRANCH"
-          if git clone --depth 1 --branch "$TARGET_BRANCH" https://github.com/BelledonneCommunications/linphone-android.git linphone-android; then
-            echo "Successfully cloned branch $TARGET_BRANCH from GitHub mirror."
-          elif git clone --depth 1 --branch "$TARGET_BRANCH" https://gitlab.linphone.org/BC/public/linphone-android.git linphone-android; then
+          TARGET_BRANCH="${{ github.event.inputs.linphone_branch || 'master' }}"
+          echo "Cloning Linphone Android branch: $TARGET_BRANCH"
+          
+          if git clone --depth 1 --branch "$TARGET_BRANCH" https://gitlab.linphone.org/BC/public/linphone-android.git linphone-android; then
             echo "Successfully cloned branch $TARGET_BRANCH from Linphone GitLab."
+          elif git clone --depth 1 --branch "$TARGET_BRANCH" https://github.com/BelledonneCommunications/linphone-android.git linphone-android; then
+            echo "Successfully cloned branch $TARGET_BRANCH from GitHub mirror."
           else
-            echo "Branch $TARGET_BRANCH failed. Falling back to default branch..."
+            echo "Direct branch clone failed. Falling back to default clone..."
+            git clone --depth 1 https://gitlab.linphone.org/BC/public/linphone-android.git linphone-android || \
             git clone --depth 1 https://github.com/BelledonneCommunications/linphone-android.git linphone-android
           fi
 
-      - name: Run Linphone Patcher (10 Calls + Messenger Bubble)
+      - name: Run Linphone Patcher (10 Calls + Headless Tel Intercept + Multi-Call Overlay Window)
         run: |
           python3 patch_linphone.py --target linphone-android
 
       - name: Configure Gradle Environment
         run: |
           cd linphone-android
-          find . -type f \( -name "*.gradle" -o -name "*.kts" -o -name "*.properties" \) -exec sed -i 's|https://linphone.org/maven_repository|https://download.linphone.org/maven_repository|g' {} +
           mkdir -p ~/.gradle
           echo "org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m -XX:+HeapDumpOnOutOfMemoryError" >> ~/.gradle/gradle.properties
           echo "org.gradle.parallel=true" >> ~/.gradle/gradle.properties
           echo "android.useAndroidX=true" >> gradle.properties
           echo "android.enableJetifier=true" >> gradle.properties
-          sed -i '/ktlint/d' app/build.gradle || true
-          sed -i '/org.jlleitschuh.gradle.ktlint/d' build.gradle || true
-          sed -i '/ktlint/d' build.gradle || true
 
       - name: Build APK with Gradle
         run: |
@@ -93,9 +81,9 @@ jobs:
           chmod +x ./gradlew
           BUILD_TYPE="${{ github.event.inputs.build_type || 'debug' }}"
           if [ "$BUILD_TYPE" = "release" ]; then
-            ./gradlew assembleRelease -x test -x lint --stacktrace --no-daemon || ./gradlew assembleDebug -x test -x lint --stacktrace --no-daemon
+            ./gradlew assembleRelease --stacktrace --no-daemon || ./gradlew assembleDebug --stacktrace --no-daemon
           else
-            ./gradlew assembleDebug -x test -x lint --stacktrace --no-daemon
+            ./gradlew assembleDebug --stacktrace --no-daemon
           fi
 
       - name: Prepare APK Artifacts
