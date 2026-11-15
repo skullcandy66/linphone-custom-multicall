@@ -659,7 +659,7 @@ class CallBubbleOverlayService : Service() {
                 gravity = Gravity.CENTER_VERTICAL
                 val rowBg = GradientDrawable().apply {
                     cornerRadius = dpToPx(8).toFloat()
-                    setColor(if (isStreamsRunning) Color.parseColor("#2E3440")) else Color.parseColor("#1F232A"))
+                    setColor(if (isStreamsRunning) Color.parseColor("#2E3440") else Color.parseColor("#1F232A"))
                     setStroke(dpToPx(1), if (isStreamsRunning) Color.parseColor("#4C566A") else Color.TRANSPARENT)
                 }
                 background = rowBg
@@ -1032,7 +1032,10 @@ class LinphonePatcher:
 
                 if file_path.suffix == ".kt":
                     import_stmt = "import org.linphone.overlay.CallBubbleOverlayService\nimport org.linphone.multicall.MultiCallHelper\n"
-                    content = import_stmt + content
+                    if "package " in content:
+                        content = re.sub(r"(package\s+[^\n]+)", r"\1\n\n" + import_stmt, content, count=1)
+                    else:
+                        content = import_stmt + content
 
                     if "override fun onCallStateChanged" in content:
                         hook_code = '''
