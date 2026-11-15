@@ -38,9 +38,9 @@ jobs:
           cache: 'gradle'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          cmdline-tools-version: 11076708
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools"
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -80,11 +80,11 @@ jobs:
           cd linphone-android
           chmod +x ./gradlew
           BUILD_TYPE="${{ github.event.inputs.build_type || 'debug' }}"
-          GRADLE_FLAGS="-x test -x lint -x ktlintCheck -x ktlintFormat -x runKtlintCheckOverMainSourceSet -x runKtlintFormatOverMainSourceSet --stacktrace --no-daemon"
+          GRADLE_FLAGS="-x test -x lint -x ktlintCheck -x ktlintFormat -x runKtlintFormatOverMainSourceSet -x runKtlintCheckOverMainSourceSet"
           if [ "$BUILD_TYPE" = "release" ]; then
-            ./gradlew assembleRelease $GRADLE_FLAGS || ./gradlew assembleDebug $GRADLE_FLAGS
+            ./gradlew assembleRelease $GRADLE_FLAGS --stacktrace --no-daemon || ./gradlew assembleDebug $GRADLE_FLAGS --stacktrace --no-daemon
           else
-            ./gradlew assembleDebug $GRADLE_FLAGS
+            ./gradlew assembleDebug $GRADLE_FLAGS --stacktrace --no-daemon
           fi
 
       - name: Prepare APK Artifacts
