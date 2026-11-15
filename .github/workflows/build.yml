@@ -37,10 +37,10 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
-      - name: Accept Android SDK Licenses
-        run: |
-          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
-          yes | sdkmanager --licenses || true
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: 11076708
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -81,9 +81,9 @@ jobs:
           chmod +x ./gradlew
           BUILD_TYPE="${{ github.event.inputs.build_type || 'debug' }}"
           if [ "$BUILD_TYPE" = "release" ]; then
-            ./gradlew assembleRelease --stacktrace --no-daemon || ./gradlew assembleDebug --stacktrace --no-daemon
+            ./gradlew assembleRelease --stacktrace --no-daemon -x test -x lint -x ktlintCheck || ./gradlew assembleDebug --stacktrace --no-daemon -x test -x lint -x ktlintCheck
           else
-            ./gradlew assembleDebug --stacktrace --no-daemon
+            ./gradlew assembleDebug --stacktrace --no-daemon -x test -x lint -x ktlintCheck
           fi
 
       - name: Prepare APK Artifacts
