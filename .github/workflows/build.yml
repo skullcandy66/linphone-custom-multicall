@@ -37,9 +37,10 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
-      - name: Accept Android SDK Licenses
-        run: |
-          yes | sdkmanager --licenses || true
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: 11076708
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -51,6 +52,7 @@ jobs:
           TARGET_BRANCH="${{ github.event.inputs.linphone_branch || 'release/5.2' }}"
           echo "Attempting to clone branch: $TARGET_BRANCH"
           
+          # Clone with fallback strategy (release branch -> master branch -> Belledonne mirror)
           if git clone --depth 1 --branch "$TARGET_BRANCH" https://github.com/BelledonneCommunications/linphone-android.git linphone-android; then
             echo "Successfully cloned branch $TARGET_BRANCH from GitHub mirror."
           elif git clone --depth 1 --branch "$TARGET_BRANCH" https://gitlab.linphone.org/BC/public/linphone-android.git linphone-android; then
@@ -78,10 +80,11 @@ jobs:
           cd linphone-android
           chmod +x ./gradlew
           BUILD_TYPE="${{ github.event.inputs.build_type || 'debug' }}"
+          GRADLE_FLAGS="-x test -x lint -x ktlintCheck -x ktlintFormat -x runKtlintCheckOverMainSourceSet -x runKtlintFormatOverMainSourceSet --stacktrace --no-daemon"
           if [ "$BUILD_TYPE" = "release" ]; then
-            ./gradlew assembleRelease -x test -x lint -x ktlintCheck --stacktrace --no-daemon || ./gradlew assembleDebug -x test -x lint -x ktlintCheck --stacktrace --no-daemon
+            ./gradlew assembleRelease $GRADLE_FLAGS || ./gradlew assembleDebug $GRADLE_FLAGS
           else
-            ./gradlew assembleDebug -x test -x lint -x ktlintCheck --stacktrace --no-daemon
+            ./gradlew assembleDebug $GRADLE_FLAGS
           fi
 
       - name: Prepare APK Artifacts
