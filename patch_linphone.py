@@ -713,20 +713,21 @@ class CallBubbleOverlayService : Service() {
 
             // Button 1: MUTE
             val muteBtn = TextView(this).apply {
-                text = "Mute"
+                text = if (call.microphoneMuted) "Muted" else "Mute"
                 setTextColor(Color.WHITE)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
                 val mBg = GradientDrawable().apply {
                     cornerRadius = dpToPx(6).toFloat()
-                    setColor(Color.parseColor("#4A4A5A"))
+                    setColor(if (call.microphoneMuted) Color.parseColor("#D08770") else Color.parseColor("#4A4A5A"))
                 }
                 background = mBg
                 setPadding(dpToPx(6), dpToPx(4), dpToPx(6), dpToPx(4))
                 setOnClickListener {
                     try {
-                        val newMic = !core.isMicEnabled
-                        core.enableMic(newMic)
-                        text = if (!newMic) "Muted" else "Mute"
+                        val isMuted = call.microphoneMuted
+                        call.microphoneMuted = !isMuted
+                        text = if (!isMuted) "Muted" else "Mute"
+                        (background as? GradientDrawable)?.setColor(if (!isMuted) Color.parseColor("#D08770") else Color.parseColor("#4A4A5A"))
                     } catch (e: Exception) {
                         e.printStackTrace()
                     }
