@@ -77,6 +77,7 @@ jobs:
       - name: Configure Gradle Environment
         run: |
           cd linphone-android
+          find . -type f \( -name "*.gradle" -o -name "*.kts" -o -name "*.properties" \) -exec sed -i 's|https://linphone.org/maven_repository|https://download.linphone.org/maven_repository|g' {} +
           mkdir -p ~/.gradle
           echo "org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m -XX:+HeapDumpOnOutOfMemoryError" >> ~/.gradle/gradle.properties
           echo "org.gradle.parallel=true" >> ~/.gradle/gradle.properties
