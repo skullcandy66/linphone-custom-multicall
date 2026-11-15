@@ -916,10 +916,8 @@ class LinphonePatcher:
                     '<uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />'
                 ]
                 for perm in permissions:
-                    if perm not in content:
-                        content = content.replace("<manifest", f"<manifest\n    {perm}\n", 1)
-                        if perm not in content:
-                            content = content.replace("<application", f"    {perm}\n<application", 1)
+                    if perm not in content and "<application" in content:
+                        content = content.replace("<application", f"{perm}\n    <application", 1)
                         modified = True
 
                 # 3. TelCallInterceptActivity + CallBubbleOverlayService
