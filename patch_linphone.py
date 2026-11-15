@@ -1196,17 +1196,30 @@ class LinphonePatcher:
             return
         }
 '''
-                    # Inject at start of onCreate and onResume
-                    content = re.sub(
-                        r"(override\s+fun\s+onCreate[^{]*\{)",
-                        r"\1" + hook,
-                        content
-                    )
-                    content = re.sub(
-                        r"(override\s+fun\s+onResume[^{]*\{)",
-                        r"\1" + hook,
-                        content
-                    )
+                    # Inject right AFTER super.onCreate(...) so Android's SuperNotCalledException is never thrown
+                    if "super.onCreate(" in content:
+                        content = re.sub(
+                            r"(super\.onCreate\([^\)]*\))",
+                            r"\1\n" + hook,
+                            content,
+                            count=1
+                        )
+                    else:
+                        content = re.sub(
+                            r"(override\s+fun\s+onCreate[^{]*\{)",
+                            r"\1\n        super.onCreate(savedInstanceState)\n" + hook,
+                            content,
+                            count=1
+                        )
+
+                    # Inject right AFTER super.onResume()
+                    if "super.onResume()" in content:
+                        content = re.sub(
+                            r"(super\.onResume\(\))",
+                            r"\1\n" + hook,
+                            content,
+                            count=1
+                        )
                     file_path.write_text(content, encoding="utf-8")
                     print(f"  -> Injected CallActivity defensive suppression: {file_path.relative_to(self.target_dir)}")
             except Exception as e:
